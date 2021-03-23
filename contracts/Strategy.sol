@@ -37,9 +37,10 @@ import "@openzeppelin/contracts/utils/Address.sol";
 import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 
 import "./interfaces/UniswapInterfaces/IUniswapV2Router02.sol";
-
+import "./interfaces/UniswapInterfaces/IUniswapV2Pair.sol";
 // Import interfaces for many popular DeFi projects, or add your own!
 //import "../interfaces/<protocol>/<Interface>.sol";
+import {Babylonian} from "./Libraries.sol";
 
 contract Strategy is BaseStrategy {
     using SafeERC20 for IERC20;
@@ -49,18 +50,21 @@ contract Strategy is BaseStrategy {
     address public masterchef;
     address public reward;
 
-    address private constant uniswapRouter =
-        address(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
-    address private constant sushiswapRouter =
-        address(0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F);
-    address private constant weth =
-        address(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+    address private constant pancakeswapRouter =
+        address(0x05fF2B0DB69458A0750badebc4f9e13aDd608C7F);
+    address private constant bscRouter =
+        address(0xd954551853F55deb4Ae31407c423e67B1621424A);
+    address private constant wbnb =
+        address(0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c);
 
     address public router;
 
     uint256 public pid;
 
     address[] public path;
+    address[] public bnbToInTokenPath;
+    address token0;
+    address token1;
 
     event Cloned(address indexed clone);
 
@@ -100,7 +104,7 @@ contract Strategy is BaseStrategy {
             "Masterchef Strategy already initialized"
         );
         require(
-            _router == uniswapRouter || _router == sushiswapRouter,
+            _router == pancakeswapRouter || _router == bscRouter,
             "incorrect router"
         );
 
@@ -119,6 +123,12 @@ contract Strategy is BaseStrategy {
 
         want.safeApprove(_masterchef, uint256(-1));
         IERC20(reward).safeApprove(router, uint256(-1));
+
+        token0 = IUniswapV2Pair(address(want)).token0();
+        token1 = IUniswapV2Pair(address(want)).token1();
+
+        IERC20(token0).safeApprove(router, uint256(-1));
+        IERC20(token1).safeApprove(router, uint256(-1));
     }
 
     function cloneStrategy(
@@ -182,33 +192,32 @@ contract Strategy is BaseStrategy {
         emit Cloned(newStrategy);
     }
 
-    function setRouter(address _router)
-        public
-        onlyAuthorized
-    {
+    function setRouter(address _router) public onlyAuthorized {
         require(
-            _router == uniswapRouter || _router == sushiswapRouter,
+            _router == pancakeswapRouter || _router == bscRouter,
             "incorrect router"
         );
 
         router = _router;
         IERC20(reward).safeApprove(router, 0);
         IERC20(reward).safeApprove(router, uint256(-1));
-
     }
 
-    function setPath(address[] calldata _path)
+    function setPath(address[] calldata _path) public onlyGovernance {
+        path = _path;
+    }
+
+    function setbnbToInTokenPath(address[] calldata _path)
         public
         onlyGovernance
     {
-        path = _path;
-
+        bnbToInTokenPath = _path;
     }
 
     // ******** OVERRIDE THESE METHODS FROM BASE CONTRACT ************
 
     function name() external view override returns (string memory) {
-        return "StrategyMasterchefGeneric";
+        return "StrategyMasterchefPairGeneric";
     }
 
     function estimatedTotalAssets() public view override returns (uint256) {
@@ -299,42 +308,168 @@ contract Strategy is BaseStrategy {
     }
 
     // NOTE: Can override `tendTrigger` and `harvestTrigger` if necessary
+    function harvestTrigger(uint256 callCost)
+        public
+        view
+        override
+        returns (bool)
+    {
+        callCost = convertBnbToWant(callCost);
+        return super.harvestTrigger(callCost);
+    }
+
+    function convertBnbToWant(uint256 bnbAmount) public view returns (uint256) {
+        uint256 swapedAmount;
+        address tokenOut;
+
+        if (bnbToInTokenPath.length == 0) {
+            address[] memory tpath;
+            tpath = new address[](2);
+            tpath[0] = wbnb;
+            tpath[1] = token0;
+
+            swapedAmount = IUniswapV2Router02(router).getAmountsOut(
+                bnbAmount,
+                tpath
+            )[1];
+            tokenOut = tpath[tpath.length - 1];
+        } else {
+            swapedAmount = IUniswapV2Router02(router).getAmountsOut(
+                bnbAmount,
+                bnbToInTokenPath
+            )[bnbToInTokenPath.length - 1];
+            tokenOut = path[path.length - 1];
+        }
+
+        if (swapedAmount == 0) {
+            return uint256(-1);
+        }
+
+        address[] memory tpath;
+        tpath = new address[](2);
+
+        (uint256 res0, uint256 res1, ) =
+            IUniswapV2Pair(address(want)).getReserves();
+
+        uint256 reserveIn = tokenOut == token0 ? res0 : res1;
+
+        if (tokenOut == token0) {
+            tpath[0] = token0;
+            tpath[1] = token1;
+        } else {
+            tpath[0] = token1;
+            tpath[1] = token0;
+        }
+
+        uint256 left =
+            swapedAmount - calculateSwapInAmount(reserveIn, swapedAmount);
+        // we estimate the amount of want
+        uint256 totalSupply = IUniswapV2Pair(address(want)).totalSupply();
+        return (left * totalSupply) / reserveIn;
+    }
 
     function prepareMigration(address _newStrategy) internal override {
         liquidatePosition(uint256(-1)); //withdraw all. does not matter if we ask for too much
         _sell();
     }
 
-    function emergencyWithdrawal(uint256 _pid) external  onlyGovernance{
+    function emergencyWithdrawal(uint256 _pid) external onlyGovernance {
         ChefLike(masterchef).emergencyWithdraw(_pid);
     }
 
     //sell all function
     function _sell() internal {
-
         uint256 rewardBal = IERC20(reward).balanceOf(address(this));
-        if( rewardBal == 0){
+
+        if (rewardBal == 0) {
             return;
         }
 
+        uint256 _wantProfit;
+        IUniswapV2Router02 uniswapV2Router = IUniswapV2Router02(router);
 
-        if(path.length == 0){
+        address tokenOut;
+
+        if (path.length == 0) {
             address[] memory tpath;
-            if(address(want) != weth){
+            if (address(token0) != wbnb) {
                 tpath = new address[](3);
-                tpath[2] = address(want);
-            }else{
+                tpath[2] = address(token0);
+            } else {
                 tpath = new address[](2);
             }
-            
+
             tpath[0] = address(reward);
-            tpath[1] = weth;
+            tpath[1] = wbnb;
+            IUniswapV2Router02(router).swapExactTokensForTokens(
+                rewardBal,
+                uint256(0),
+                tpath,
+                address(this),
+                now
+            );
+            tokenOut = tpath[tpath.length - 1];
+        } else {
+            IUniswapV2Router02(router).swapExactTokensForTokens(
+                rewardBal,
+                uint256(0),
+                path,
+                address(this),
+                now
+            );
+            tokenOut = path[path.length - 1];
+        }
 
-            IUniswapV2Router02(router).swapExactTokensForTokens(rewardBal, uint256(0), tpath, address(this), now);
-        }else{
-            IUniswapV2Router02(router).swapExactTokensForTokens(rewardBal, uint256(0), path, address(this), now);
-        }  
+        uint256 tokenOutAmount = IERC20(tokenOut).balanceOf(address(this));
 
+        (uint256 res0, uint256 res1, ) =
+            IUniswapV2Pair(address(want)).getReserves();
+
+        uint256 reserveIn = tokenOut == token0 ? res0 : res1;
+
+        address[] memory tpath = new address[](2);
+        if (tokenOut == token0) {
+            tpath[0] = token0;
+            tpath[1] = token1;
+        } else {
+            tpath[0] = token1;
+            tpath[1] = token0;
+        }
+
+        uint256 amountToSwap = calculateSwapInAmount(reserveIn, tokenOutAmount);
+
+        uint256[] memory amounts =
+            uniswapV2Router.swapExactTokensForTokens(
+                amountToSwap,
+                0,
+                tpath,
+                address(this),
+                now
+            );
+
+        uniswapV2Router.addLiquidity(
+            tpath[0],
+            tpath[1],
+            tokenOutAmount - amountToSwap,
+            amounts[1],
+            1,
+            1,
+            address(this),
+            now
+        );
+    }
+
+    function calculateSwapInAmount(uint256 reserveIn, uint256 userIn)
+        public
+        pure
+        returns (uint256)
+    {
+        return
+            Babylonian
+                .sqrt(
+                reserveIn.mul(userIn.mul(3988000) + reserveIn.mul(3988009))
+            )
+                .sub(reserveIn.mul(1997)) / 1994;
     }
 
     function protectedTokens()
