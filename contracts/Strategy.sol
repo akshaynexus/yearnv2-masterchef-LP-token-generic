@@ -26,6 +26,11 @@ interface ChefLike {
         external
         view
         returns (uint256, uint256);
+
+    function pendingCake(uint256 _pid, address _user)
+        external
+        view
+        returns (uint256);
 }
 
 // These are the core Yearn libraries
@@ -207,7 +212,7 @@ contract Strategy is BaseStrategy {
         path = _path;
     }
 
-    function setbnbToInTokenPath(address[] calldata _path)
+    function setBnbToInTokenPath(address[] calldata _path)
         public
         onlyGovernance
     {
@@ -223,7 +228,13 @@ contract Strategy is BaseStrategy {
     function estimatedTotalAssets() public view override returns (uint256) {
         (uint256 deposited, ) =
             ChefLike(masterchef).userInfo(pid, address(this));
-        return want.balanceOf(address(this)).add(deposited);
+        uint256 pendingRewards =
+            ChefLike(masterchef).pendingCake(pid, address(this));
+
+        return
+            want.balanceOf(address(this)).add(deposited).add(
+                rewardsToWants(pendingRewards)
+            );
     }
 
     function prepareReturn(uint256 _debtOutstanding)
@@ -344,22 +355,10 @@ contract Strategy is BaseStrategy {
         if (swapedAmount == 0) {
             return uint256(-1);
         }
-
-        address[] memory tpath;
-        tpath = new address[](2);
-
         (uint256 res0, uint256 res1, ) =
             IUniswapV2Pair(address(want)).getReserves();
 
         uint256 reserveIn = tokenOut == token0 ? res0 : res1;
-
-        if (tokenOut == token0) {
-            tpath[0] = token0;
-            tpath[1] = token1;
-        } else {
-            tpath[0] = token1;
-            tpath[1] = token0;
-        }
 
         uint256 left =
             swapedAmount - calculateSwapInAmount(reserveIn, swapedAmount);
@@ -377,6 +376,49 @@ contract Strategy is BaseStrategy {
         ChefLike(masterchef).emergencyWithdraw(_pid);
     }
 
+    function rewardsToWants(uint256 rewardBal) public view returns (uint256) {
+        if (rewardBal == 0) {
+            return 0;
+        }
+
+        IUniswapV2Router02 uniswapV2Router = IUniswapV2Router02(router);
+        address tokenOut;
+        uint256 amountOut;
+
+        if (path.length == 0) {
+            address[] memory tpath;
+            if (address(token0) != wbnb) {
+                tpath = new address[](3);
+                tpath[2] = address(token0);
+            } else {
+                tpath = new address[](2);
+            }
+
+            tpath[0] = address(reward);
+            tpath[1] = wbnb;
+            amountOut = IUniswapV2Router02(router).getAmountsOut(
+                rewardBal,
+                tpath
+            )[tpath.length - 1];
+            tokenOut = tpath[tpath.length - 1];
+        } else {
+            amountOut = IUniswapV2Router02(router).getAmountsOut(
+                rewardBal,
+                path
+            )[path.length - 1];
+            tokenOut = path[path.length - 1];
+        }
+        (uint256 res0, uint256 res1, ) =
+            IUniswapV2Pair(address(want)).getReserves();
+
+        uint256 reserveIn = tokenOut == token0 ? res0 : res1;
+
+        uint256 left = amountOut - calculateSwapInAmount(reserveIn, amountOut);
+        // we estimate the amount of want
+        uint256 totalSupply = IUniswapV2Pair(address(want)).totalSupply();
+        return (left * totalSupply) / reserveIn;
+    }
+
     //sell all function
     function _sell() internal {
         uint256 rewardBal = IERC20(reward).balanceOf(address(this));
@@ -385,7 +427,6 @@ contract Strategy is BaseStrategy {
             return;
         }
 
-        uint256 _wantProfit;
         IUniswapV2Router02 uniswapV2Router = IUniswapV2Router02(router);
 
         address tokenOut;

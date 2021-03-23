@@ -3,6 +3,7 @@ from brownie import Contract
 from useful_methods import genericStateOfVault, genericStateOfStrat
 import random
 import pytest
+from brownie import chain
 
 
 def test_apr(accounts, token, vault, strategy, chain, strategist, whale):
@@ -161,12 +162,22 @@ def test_sweep(gov, vault, strategy, token, amount, wbnb, wbnb_amout):
     assert wbnb.balanceOf(gov) == wbnb_amout
 
 
-def test_triggers(gov, vault, strategy, token, amount, wbnb, wbnb_amout):
+def test_triggers(gov, vault, strategy, token, amount, wbnb, wbnb_amout, masterchef):
     # Deposit to the vault and harvest
     token.approve(vault.address, amount, {"from": gov})
     vault.deposit(amount, {"from": gov})
     vault.updateStrategyDebtRatio(strategy.address, 5_000, {"from": gov})
     strategy.harvest()
+    strategy.setDebtThreshold(10 ** (token.decimals() - 2))
 
-    strategy.harvestTrigger(0)
-    strategy.tendTrigger(0)
+    strategy.setMaxReportDelay(3600 * 24 * 60)
+    strategy.setMinReportDelay(3600 * 24)
+    # strategy.setBnbToInTokenPath()
+    chain.sleep(1)
+
+    assert False == strategy.harvestTrigger("0.1 ether")
+    chain.sleep(3600 * 24 * 30)
+    masterchef.updatePool(102, {"from": gov})
+
+    assert False == strategy.harvestTrigger("0.1 ether")
+    assert True == strategy.harvestTrigger("0.00000001 ether")
