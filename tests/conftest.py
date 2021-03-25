@@ -40,12 +40,12 @@ def cake(interface):
 
 @pytest.fixture
 def masterchef(interface):
-    yield Contract("0x73feaa1ee314f8c655e354234017be2193c9e24e")
+    yield interface.ChefLike("0x73feaa1ee314f8c655e354234017be2193c9e24e")
 
 
 @pytest.fixture
-def router():
-    yield Contract("0x05fF2B0DB69458A0750badebc4f9e13aDd608C7F")
+def router(interface):
+    yield interface.IUniswapV2Router02("0x05fF2B0DB69458A0750badebc4f9e13aDd608C7F")
 
 
 @pytest.fixture

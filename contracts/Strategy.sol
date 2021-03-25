@@ -31,6 +31,7 @@ interface ChefLike {
         external
         view
         returns (uint256);
+    function updatePool(uint pid) external;
 }
 
 // These are the core Yearn libraries
